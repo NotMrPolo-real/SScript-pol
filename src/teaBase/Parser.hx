@@ -19,12 +19,10 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-package hscriptBase;
-import haxe.macro.Compiler;
-import haxe.macro.Context;
+package teaBase;
 import haxe.Exception;
-import hscriptBase.Expr;
 import tea.SScript;
+import teaBase.Expr;
 using StringTools;
 
 enum Token {
@@ -32,6 +30,7 @@ enum Token {
 	TConst( c : Const );
 	TId( s : String );
 	TOp( s : String );
+	TEReg( r : String , opt : String );
 	TPOpen;
 	TPClose;
 	TBrOpen;
@@ -42,17 +41,21 @@ enum Token {
 	TEol;
 	TBkOpen;
 	TBkClose;
+	TQDot;
+	TQDouble;
+	TQDoubleAssign;
 	TQuestion;
 	TDoubleDot;
-	TMeta( s : String );
-	TPrepro( s : String );
+	TMeta( hasDot : Bool , s : String );
 }
 
+@:keep
+@:access(teaBase.Tools)
 @:access(tea.SScript)
 class Parser {
 
 	// config / variables
-	public var line : Int;
+	public var line : Int = 0;
 	public var opChars : String;
 	public var identChars : String;
 	#if haxe3
@@ -63,14 +66,7 @@ class Parser {
 	public var opRightAssoc : Hash<Bool>;
 	#end
 
-	public var script:tea.SScript;
-
-	@:noPrivateAccess var packaged : Bool;
-
-	/**
-		activate JSON compatiblity
-	**/
-	public var allowJSON : Bool;
+	@:noPrivateAccess var packaged : Bool = false;
 
 	/**
 		allow types declarations
@@ -78,19 +74,11 @@ class Parser {
 	public var allowTypes : Bool =  true;
 
 	/**
-		allow haxe metadata declarations
-	**/
-	public var allowMetadata : Bool;
-
-	/**
 		resume from parsing errors (when parsing incomplete code, during completion for example)
 	**/
-	public var resumeErrors : Bool;
+	public var resumeErrors : Bool = false;
 
-	var interp :Interp;
-
-	inline function setIntrp(interp) 
-		return this.interp = interp;
+	var inInterp : Bool = false;
 
 	// implementation
 	var input : String;
@@ -101,36 +89,29 @@ class Parser {
 	var idents : Array<Bool>;
 	var uid : Int = 0;
 
-	#if hscriptPos
 	var origin : String;
 	var tokenMin : Int;
 	var tokenMax : Int;
 	var oldTokenMin : Int;
 	var oldTokenMax : Int;
 	var tokens : List<{ min : Int, max : Int, t : Token }>;
-	#else
-	static inline var p1 = 0;
-	static inline var tokenMin = 0;
-	static inline var tokenMax = 0;
-	#if haxe3
-	var tokens : haxe.ds.GenericStack<Token>;
-	#else
-	var tokens : haxe.FastList<Token>;
-	#end
 
-	#end
+	var script : SScript;
+
+	function setScr(scr) script = scr;
 
 	public function new() {
 		line = 1;
-		opChars = "+*/-=!><&|^%~";
+		opChars = "+*/-=!><&|^%";
 		identChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
 		var priorities = [
+			["is"], 
 			["%"],
 			["*", "/"],
 			["+", "-"],
 			["<<", ">>", ">>>"],
 			["|", "&", "^"],
-			["==", "!=", ">", "<", ">=", "<=", "==="],
+			["==", "!=", ">", "<", ">=", "<="],
 			["..."],
 			["&&"],
 			["||"],
@@ -147,20 +128,16 @@ class Parser {
 		for( i in 0...priorities.length )
 			for( x in priorities[i] ) {
 				opPriority.set(x, i);
-				if( i == 9 ) opRightAssoc.set(x, true);
+				if( i == 10 ) opRightAssoc.set(x, true);
 			}
-		for( x in ["!", "++", "--", "~", "cast", "untyped"] ) // unary "-" handled in parser directly!
+		for( x in ["!", "++", "--",] ) // unary "-" handled in parser directly!
 			opPriority.set(x, x == "++" || x == "--" ? -1 : -2);
 	}
 
 	public inline function error( err, ?pmin, ?pmax ) {
-		var e=#if hscriptPos new Error(err, pmin, pmax, origin, line) #else err #end;
+		var e=new Error(err, pmin, pmax, origin, line);
 		if( !resumeErrors )
-		#if hscriptPos
 		throw new Error(err, pmin, pmax, origin, line);
-		#else
-		throw err;
-		#end
 	}
 
 	public function invalidChar(c) {
@@ -168,18 +145,11 @@ class Parser {
 	}
 
 	function initParser( origin ) {
-		preprocStack = [];
-		#if hscriptPos
 		this.origin = origin;
 		readPos = 0;
 		tokenMin = oldTokenMin = 0;
 		tokenMax = oldTokenMax = 0;
 		tokens = new List();
-		#elseif haxe3
-		tokens = new haxe.ds.GenericStack<Token>();
-		#else
-		tokens = new haxe.FastList<Token>();
-		#end
 		char = -1;
 		ops = new Array();
 		idents = new Array();
@@ -190,7 +160,7 @@ class Parser {
 			idents[identChars.charCodeAt(i)] = true;
 	}
 
-	public function parseString( s : String, ?origin : String = "hscript" ) {
+	public function parseString( s : String, ?origin : String = "SScript" ) {
 		initParser(origin);
 		input = s;
 		readPos = 0;
@@ -210,13 +180,9 @@ class Parser {
 	}
 
 	inline function push(tk) {
-		#if hscriptPos
 		tokens.push( { t : tk, min : tokenMin, max : tokenMax } );
 		tokenMin = oldTokenMin;
 		tokenMax = oldTokenMax;
-		#else
-		tokens.add(tk);
-		#end
 	}
 
 	inline function ensure(tk) {
@@ -249,55 +215,45 @@ class Parser {
 	}
 
 	inline function expr(e:Expr) {
-		#if hscriptPos
 		return e.e;
-		#else
-		return e;
-		#end
 	}
 
 	inline function pmin(e:Expr) {
-		#if hscriptPos
 		return e == null ? 0 : e.pmin;
-		#else
-		return 0;
-		#end
 	}
 
 	inline function pmax(e:Expr) {
-		#if hscriptPos
 		return e == null ? 0 : e.pmax;
-		#else
-		return 0;
-		#end
 	}
 
 	inline function mk(e,?pmin,?pmax) : Expr {
-		#if hscriptPos
 		if( e == null ) return null;
 		if( pmin == null ) pmin = tokenMin;
 		if( pmax == null ) pmax = tokenMax;
 		return { e : e, pmin : pmin, pmax : pmax, origin : origin, line : line };
-		#else
-		return e;
-		#end
 	}
 
 	function isBlock(e) {
+		if( inInterp ) return true;
 		if( e == null ) return false;
 		return switch( expr(e) ) {
+		case EEAbstract(_,_,_,_): true;
+		case EClass(_,_): true;
+		case EPublic(e): isBlock(e);
+		case EPrivate(e): isBlock(e);
+		case EStatic(e,_): isBlock(e);
 		case EBlock(_), EObject(_), ESwitch(_): true;
 		case EFunction(_,e,_,_): isBlock(e);
-		case EVar(_, t, e): e != null ? isBlock(e) : t != null ? t.match(CTAnon(_)) : false;
+		case EVar(_,_,t, e): e != null ? isBlock(e) : t != null ? t.match(CTAnon(_)) : false;
 		case EIf(_,e1,e2): if( e2 != null ) isBlock(e2) else isBlock(e1);
 		case EBinop(_,_,e): isBlock(e);
 		case EUnop(_,prefix,e): !prefix && isBlock(e);
 		case EWhile(_,e): isBlock(e);
 		case EDoWhile(_,e): isBlock(e);
-		case EFor(_,_,e): isBlock(e);
+		case EFor(_,_,_,e): isBlock(e);
 		case EReturn(e): e != null && isBlock(e);
 		case ETry(_, _, _, e): isBlock(e);
-		case EMeta(_, _, e): isBlock(e);
+		case EMeta(_,_,_,e): if( e == null ) true else isBlock(e);
 		default: false;
 		}
 	}
@@ -309,16 +265,44 @@ class Parser {
 		var tk = token();
 		// this is a hack to support var a,b,c; with a single EVar
 		while( tk == TComma && e != null && expr(e).match(EVar(_)) ) {
-			e = parseStructure("var"); // next variable
+			e = parseStructure(switch Tools.expr(e) {
+				case EVar(_,f,_,_):
+					if (f) "final" else "var";
+				case _: throw "Something horribly went wrong";
+			}); // next variable
 			exprs.push(e);
 			tk = token();
 		}
 
-		if( tk != TStatement && tk != TEof ) {
-			if( isBlock(e) )
+
+		if( inEnum ) {
+			if( tk != TStatement && tk != TEof && tk != TBrClose ) {
+				switch e.e {
+					case EEAbstract(_,_,_,_):
+					case EVar(_,_,_,_):
+					case _: unexpected(tk);
+				}
+			}
+		}
+		else if( !inClass ) {
+			if( tk != TStatement && tk != TEof ) {
+				if( isBlock(e) )
+					push(tk);
+				else
+					unexpected(tk);
+			}
+		}
+		else {
+			if( tk != TStatement && tk != TEof && tk != TBrClose ) {
+				switch e.e {
+					case EClass(_,_): 
+					case EFunction(_,_,_,_):
+					case EVar(_,_,_,_): // allowed
+					case EPublic(_) | EPrivate(_):
+					case _: unexpected(tk);
+				}
 				push(tk);
-			else
-				unexpected(tk);
+			}
 		}
 	}
 
@@ -330,13 +314,6 @@ class Parser {
 			var id = null;
 			switch( tk ) {
 			case TId(i): id = i;
-			case TConst(c):
-				if( !allowJSON )
-					unexpected(tk);
-				switch( c ) {
-				case CString(s): id = s;
-				default: unexpected(tk);
-				}
 			case TBrClose:
 				break;
 			default:
@@ -357,94 +334,96 @@ class Parser {
 		return parseExprNext(mk(EObject(fl),p1));
 	}
 
-	function interpolate(s:String) {
-		var exprs:Array<Expr> = [];
-		var dollarIndex = s.indexOf('$');
+	function interpolateString(s:String)  {
+		if( s == null ) error(ECustom("Null Object Reference"));
+		
+		var strings = s.split('$');
+		if( strings.length < 2 )
+			return EConst(CString(s));
+		if( s.startsWith('$') )
+			strings.shift();
 
-		while (dollarIndex > -1) {
-			var i = dollarIndex;
-			var char = s.charAt(++i);
-			switch (char) {
-				case '$':
-					s = s.substring(0, i) + s.substr(i + 1);
-				case '{':
-					var expr = "";
-					var depth = 0;
+		var stringMap:Array< { str : String , index : Int } >  = [];
+		var startIndex:Int = 1;
+		for( i in 0...strings.length ) {
+			var index = s.indexOf(strings[i], startIndex - 1);
+			var split = s.charAt(index - 1);
 
-					var precedingSub = s.substring(0, i - 1);
-					if (precedingSub != "")
-						exprs.push(mk(EConst(CString(precedingSub))));
+			if( startIndex == index && startIndex != 1 )
+				startIndex--;
 
-					while (i < s.length) {
-						char = s.charAt(++i);
-						if (char == '{')
+			if( split == '$' && index > 0 ) {
+				var pro = 0;
+				var depth = 0;
+				var string = strings[index - startIndex];
+				var expr = "";
+				var hasBracket = false;
+				if( string != null )
+				{
+					while( true ) {
+						var a = string.charAt(pro);
+						pro++;
+						if( a == "{" )
+						{
 							depth++;
-						else if (char == '}') {
-							depth--;
-							if (depth < 0)
-								break;
+							if (!hasBracket)
+								hasBracket = true;
 						}
-						expr += char;
+						else if( a == "}" ) {
+							if( pro < 3 && hasBracket )
+								error(ECustom("Expression cannot be empty"));
+
+							depth--;
+							if (depth <= 0)
+							{
+								expr += "}";
+								break;
+							}
+						}
+
+						if( !hasBracket ) switch a {
+							
+							case "$" | "{" | "}" | " " | '':
+								break;
+							case _:
+						}
+						expr += a;
+						
 					}
-
-					exprs.push(parseString(expr #if hscriptPos, origin #end));
-					s = s.substr(i + 1);
-				case c if (c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'): // [a-zA-Z_]
-					var ident = c;
-					var precedingSub = s.substring(0, i - 1);
-					if (precedingSub != "")
-						exprs.push(mk(EConst(CString(precedingSub))));
-					while (true) {
-						char = s.charAt(++i);
-						if (char == '_' 
-						|| char >= 'a' && char <= 'z' 
-						|| char >= 'A' && char <= 'Z' 
-						|| char >= '0' && char <= '9') // [a-zA-Z0-9_]
-							ident += char;
-						else break;
-					}
-					exprs.push(mk(EIdent(ident)));
-					s = s.substr(i);
-			}
-			dollarIndex = s.indexOf('$', i);
+				}
+				if( expr != "" )
+				{ 
+					var length = strings[i].length - expr.length;
+					stringMap.push({ str : expr , index : index - startIndex });
+					startIndex += expr.length; 
+					startIndex += length;
+					if( length < 1 ) startIndex++;
+				}
+			} 	
 		}
-
-		if (exprs.length == 0)
-			exprs.push(mk(EConst(CString(s))));
-
-		var expr = exprs[0];
-		for (i in 1...exprs.length) {
-			var nextExpr = exprs[i];
-			expr = mk(EBinop('+', expr, nextExpr));
-		}
-
-		return expr;
+		return EInterpString(strings,stringMap);
 	}
 
 	function parseExpr() {
 		var oldPos = readPos;
 		var tk = token();
-		#if hscriptPos
 		var p1 = tokenMin;
-		#end
 		switch( tk ) {
-		case TPrepro("end"):
-			push(TConst(CInt(Std.int(Math.NaN)))); //a const token needs to be pushed in case the conditional checks are empty
-			return parseExpr();
 		case TId(id):
 			var e = parseStructure(id);
 			if( e == null )
-				e = mk(EIdent(id, id=="final"));
+				e = mk(EIdent(id));
 			
 			return parseExprNext(e);
+		case TEReg(char, op):
+			return mk(EEReg(char, op));
 		case TConst(c):
-			switch (c) {
-				case CString(s, interpolated):
-					if (interpolated)
-						return parseExprNext(interpolate(s));
-				default:
+			switch c {
+				case CString(s, true):
+					var e = parseExprNext(mk(interpolateString(s)));
+					return e;
+				case _:
 			}
-
 			return parseExprNext(mk(EConst(c)));
 		case TPOpen:
 			tk = token();
@@ -495,23 +474,6 @@ class Parser {
 					return parseExprNext(parseObject(p1));
 				default:
 				}
-			case TConst(c):
-				if( allowJSON ) {
-					switch( c ) {
-					case CString(_):
-						var tk2 = token();
-						push(tk2);
-						push(tk);
-						switch( tk2 ) {
-						case TDoubleDot:
-							return parseExprNext(parseObject(p1));
-						default:
-						}
-					default:
-						push(tk);
-					}
-				} else
-					push(tk);
 			default:
 				push(tk);
 			}
@@ -521,7 +483,8 @@ class Parser {
 				tk = token();
 				if( tk == TBrClose || (resumeErrors && tk == TEof) )
 					break;
-				push(tk);
+				if( tk != TStatement )
+					push(tk);
 			}
 			return mk(EBlock(a),p1);
 		case TOp(op):
@@ -538,6 +501,9 @@ class Parser {
 				default:
 					return makeUnop(op,e);
 				}
+			}
+			else if( op == '~' ) {
+				return makeUnop(op,parseExpr());
 			}
 			if( opPriority.get(op) < 0 )
 				return makeUnop(op,parseExpr());
@@ -557,7 +523,7 @@ class Parser {
 				case EFor(_), EWhile(_), EDoWhile(_):
 					var tmp = "__a_" + (uid++);
 					var e = mk(EBlock([
-						mk(EVar(tmp, null, mk(EArrayDecl([]), p1)), p1),
+						mk(EVar(tmp, false, null, mk(EArrayDecl([]), p1)), p1),
 						mapCompr(tmp, a[0]),
 						mk(EIdent(tmp),p1),
 					]),p1);
@@ -565,9 +531,10 @@ class Parser {
 				default:
 				}
 			return parseExprNext(mk(EArrayDecl(a), p1));
-		case TMeta(id) if( allowMetadata ):
+		case TMeta(dot,id):
 			var args = parseMetaArgs();
-			return mk(EMeta(id, args, parseExpr()),p1);
+			var e = try parseExpr() catch(e) null;
+			return mk(EMeta(dot,id,args,e),p1);
 		default:
 			return unexpected(tk);
 		}
@@ -620,8 +587,8 @@ class Parser {
 	function mapCompr( tmp : String, e : Expr ) {
 		if( e == null ) return null;
 		var edef = switch( expr(e) ) {
-		case EFor(v, it, e2):
-			EFor(v, it, mapCompr(tmp, e2));
+		case EFor(v, v2,it, e2):
+			EFor(v, v2,it, mapCompr(tmp, e2));
 		case EWhile(cond, e2):
 			EWhile(cond, mapCompr(tmp, e2));
 		case EDoWhile(cond, e2):
@@ -633,7 +600,7 @@ class Parser {
 		case EParent(e2):
 			EParent(mapCompr(tmp, e2));
 		default:
-			ECall(mk(EField(mk(EIdent(tmp), pmin(e), pmax(e)), "push"), pmin(e), pmax(e)), [e]);
+			ECall(mk(EField(mk(EIdent(tmp), pmin(e), pmax(e)), "push", []), pmin(e), pmax(e)), [e]);
 		}
 		return mk(edef, pmin(e), pmax(e));
 	}
@@ -667,11 +634,230 @@ class Parser {
 		}
 	}
 
-	function parseStructure(id, ?t : TrickyToken , ?d : DynamicToken) {
-		#if hscriptPos
+	var inClass : Bool = false;
+	var isClassScript : Bool = false;
+	var inStatic : Bool = false;
+	var inPublic : Bool = false;
+	var inPrivate : Bool = false;
+	var inEnum : Bool = false;
+
+	var structures : Array< String > = [];
+	function parseStructure(id) {
+		if( !inClass && !inEnum )
+			structures.push(id);
 		var p1 = tokenMin;
-		#end
+		if( isClassScript ) {
+			switch id {
+				case "class" | "package" | "import" | "using" | "enum" | "abstract" if (!inEnum):
+				case _ if (!inEnum): error(EUnexpected(id));
+			}
+			if( inEnum && Tools.enumKeys.contains(id) )
+				error(EUnexpected(id));
+		}
 		return switch( id ) {
+		case "enum":
+			if( inEnum )
+				error(EUnexpected("enum"));
+			var tk = token();
+			switch tk {
+				case TId("abstract"):
+					inEnum = true;
+				case TBrOpen: 
+					error(ECustom("Expected abstract"));
+				case _: 
+					unexpected(tk);
+			}
+
+			var v = parseStructure("abstract");
+			inEnum = false;
+			return v;
+		case "abstract":
+			if( !inEnum )
+				unexpected(TId("abstract"));
+
+			var varExprs = [];
+			var ident = getIdent();
+			isClassScript = true;
+			
+			ensure(TPOpen);
+			var parent = getIdent();
+			ensure(TPClose);
+
+			var hasFrom = false;
+			var hasTo = false;
+			while( true ) {
+				var tk = token();
+				switch tk {
+					case TId(s):
+						if( s == "from" ) { 
+							hasFrom = true;
+							var tk = token();
+							push(tk);
+							if( Type.enumEq(tk,TId("from")) ) unexpected(TId("from"));
+						}
+						else if( s == "to" ) {
+							hasTo = true;
+							var tk = token();
+							push(tk);
+							if( Type.enumEq(tk,TId("to")) ) unexpected(TId("to"));
+						}
+						if( !hasFrom && !hasTo ) unexpected(tk);
+					case TBrOpen: 
+						var tk = token();
+						if( tk == TBrClose ) break;
+						else {
+							push(tk);
+							while( true ) {
+								var tk = token();
+								if( tk != TStatement && tk != TBrClose && tk != TEof )
+									push(tk);
+								if( tk == TBrClose || tk == TEof ) break;
+							
+								var expr1 = parseExpr();
+								varExprs.push(expr1);
+								tk = token();
+							}
+							break;
+						}
+					case _: unexpected(tk);
+				}
+			}
+			return mk(EEAbstract(ident,parent,varExprs,null));
+		case "class":
+			if( inClass )
+				unexpected(TId("class"));
+			else for( i in structures ) {
+				if( ["class", "package", "import", "using", "enum", "abstract"].contains(i) )
+					continue;
+				else error(EUnexpected(i));
+			}
+
+			var hasAnotherClasses = false;
+			inClass = true;
+			var e = null;
+			var exprs = [];
+			var classes = [];
+			var ident = getIdent();
+			var path = [];
+			var extended = false;
+			var token = null; 
+			while( true ) {
+				token = this.token();
+				switch token {
+					case TId("extends"):
+						error(ECustom("extends is not supported"));
+					case TBrOpen:
+						var processes = 0;
+						while( true ) {
+							var tk = this.token();
+							if( Type.enumEq(tk,TId('class')) && processes > 0 ) {
+								hasAnotherClasses = true;
+								inClass = false;
+							}
+							else 
+								inClass = true;
+							if( tk == TBrClose || tk == TEof ) break;
+							push(tk);
+							if( !hasAnotherClasses )
+								parseFullExpr(exprs);
+							else 
+								classes.push(parseExpr());
+
+							processes++;
+						}
+						break;
+					case _: unexpected(token);
+				}
+			}
+			inClass = false;
+			isClassScript = true;
+			var e = EClass(ident,exprs);
+			classes.insert(0, mk(e));
+			return mk(hasAnotherClasses ? EBlock(classes) : e);			
+		case "public" | "private":
+			if( inPublic && id == "public" )
+				error(ECustom('Unexpected public'));
+			else if( inPrivate && id == "private" )
+				error(ECustom('Unexpected private'));
+
+			var usedStatic:Bool = false;
+			if( id == "public" )
+				inPublic = true;
+			else 
+				inPrivate = true;
+
+			while( true )
+			{
+				var tk = token();
+				switch tk {
+					case TId(s):
+						switch s {
+							case "var", "final", "function": // allowed 
+								push(tk);
+								inStatic = false;
+								break;
+							case "static":
+								if( inStatic )
+									unexpected(TId("static"));
+								inStatic = true;
+								usedStatic = true;
+							case _: 
+								unexpected(tk);
+						}
+					case _: unexpected(tk);
+				}
+			}
+			var e = parseExpr();
+			if( usedStatic )
+				e = mk(EStatic(e),pmin(e));
+			var mk = mk(inPublic ? EPublic(e) : EPrivate(e), pmin(e), pmax(e));
+			if( id == "public" )
+				inPublic = false;
+			else 
+				inPrivate = false;
+			return mk;
+		case "static":
+			var tk = token();
+			switch tk {
+				case TId(s):
+					switch s {
+						case "var", "final", "function": // allowed
+							push(tk);
+
+							var e = parseExpr();
+							var pmin = pmin(e);
+							var e = EStatic(e, inPublic);
+							return mk(e, pmin);
+						case "public" | "private": // needs checking
+							if( ( s == "public" && inPublic ) 
+								|| ( s == "private" && inPrivate ) )
+								unexpected(tk);
+
+							while( true ) {
+								var tk = token();
+								push(tk);
+
+								switch tk {
+									case TId(s):
+										switch s {
+											case "var", "final", "function": break;
+											case _: unexpected(tk);
+										}
+									case _: unexpected(tk);
+								}
+							}
+
+							var e = parseExpr();
+							var pmin = pmin(e);
+							var e = EStatic(mk(s == "public" ? EPublic(e) : EPrivate(e)));
+							return mk(e, pmin);
+						case _:
+							unexpected(tk);
+					}
+				case _:
+					unexpected(tk);
+			}
+			return null;
 		case "if":
 			ensure(TPOpen);
 			var cond = parseExpr();
@@ -691,41 +877,22 @@ class Parser {
 				if( semic ) push(TStatement);
 			}
 			mk(EIf(cond,e1,e2),p1,(e2 == null) ? tokenMax : pmax(e2));
-		case "var":
-			var ident = getIdent();
+		case "var" | "final":
 			var tk = token();
-			var getter = null;
-			var setter = null;
-			if(tk==TPOpen)
-			{
-				if(t==null) {
-					error(EExpectedField(ident));
-				}
-				var tk2 = token();
-				var nulls=["default","null","get","set"];
-				switch(tk2){
-					case TId(s):if(!nulls.copy().contains(""+s))unexpected(tk2);
-					getter = s;
-					default: unexpected(tk2);
-				}
-				var tk2 = token();
-				switch(tk2){
-					case TComma://allowed
-					default: unexpected(tk2);
-				}
-				var tk2 = token();
-				switch(tk2){
-					case TId(s):if(!nulls.copy().contains(""+s))unexpected(tk2);
-					setter = s;
-					default: unexpected(tk2);
-				}
-				var tk2 = token();
-				switch(tk2){
-					case TPClose://allowed
-					default: unexpected(tk2);
-				}
-				tk = token();
+			var ident = switch tk {
+				case TId(s): s;
+				case TConst(c):
+					switch c {
+						case CInt(_) | CFloat(_):
+							error(ECustom('Missing variable identifier'),tokenMin,tokenMax);
+							null;
+						case _: null;
+					}
+				case _:
+					error(ECustom('Missing variable identifier'),tokenMin,tokenMax);
+					null;
 			}
+			var tk = token();
 			var tp = null;
 			if( tk == TDoubleDot && allowTypes ) {
 				tp = parseType();
@@ -735,62 +902,24 @@ class Parser {
 			switch (tk)
 			{
 				case TOp("="): e = parseExpr();
-				@:privateAccess 
-				if(tp!=null) switch (tp) {
-					case CTPath(p,pr):
-						
-					default:
-				}
 				case TComma | TStatement: push(tk);
+				#if static
 				if (tp != null) switch(tp){
 					case CTPath(p,pr):
 					switch(p[0]){
 						case "Int":
 							e = mk(EConst(CInt(0)));
 						case "Bool":
-							e = mk(EIdent("false",false));
+							e = mk(EIdent("false"));
 						case "Float":
 							e = mk(EConst(CFloat(0.0)));
 					}
 					default:
 				}
+				#end
 				default: unexpected(tk);
 			}
-			mk(EVar(ident,tp,e,t,[getter,setter,]),p1,(e == null) ? tokenMax : pmax(e));
-		case "final":
-			var ident = getIdent();
-			var tk = token();
-			var tp = null;
-			if( tk == TDoubleDot && allowTypes ) {
-				tp = parseType();
-				tk = token();
-			}
-			var e = null;
-			switch (tk)
-			{
-				case TOp("="): e = parseExpr();
-				/*if(tp!=null) switch (tp) {
-					case CTPath(p,pr):
-						@:privateAccess if(p[0]!=Tools.getType(interp.expr(e)) && interp.expr(e) != null)
-						error(EUnmatcingType(Tools.getType(interp.expr(e)),p[0]));
-					default:
-				}*/
-				case TComma | TStatement: push(tk);
-				switch(tp){
-					case CTPath(p,pr):
-					switch(p[0]){
-						case "Int":
-							e = mk(EConst(CInt(0)));
-						case "Bool":
-							e = mk(EIdent("false",false));
-						case "Float":
-							e = mk(EConst(CFloat(0.0)));
-					}
-					default:
-				}
-				default: unexpected(tk);
-			}
-			mk(EFinal(ident,tp,e,t),p1,(e == null) ? tokenMax : pmax(e));
+			mk(EVar(ident,id=="final",tp,e),p1,(e == null) ? tokenMax : pmax(e));
 		case "while":
 			var econd = parseExpr();
 			var e = parseExpr();
@@ -808,102 +937,21 @@ class Parser {
 		case "for":
 			ensure(TPOpen);
 			var vname = getIdent();
+			var vname2 = null;
+			var tk = token();
+			switch tk {
+				case TOp("=>"): 
+					vname2 = getIdent();
+				case _: push(tk);
+			}
 			ensureToken(TId("in"));
 			var eiter = parseExpr();
 			ensure(TPClose);
 			var e = parseExpr();
-			mk(EFor(vname,eiter,e),p1,pmax(e));
+			mk(EFor(vname,vname2,eiter,e),p1,pmax(e));
 		case "break": mk(EBreak);
 		case "continue": mk(EContinue);
 		case "else": unexpected(TId(id));
-		case "dynamic":
-			var maybe=maybe(TId("function"));
-			if (!maybe)
-				error(EExpectedField('function'));
-			parseStructure("function", null, {v: true});
-		case "private":
-			var maybeIdent="inline";
-			var maybe=maybe(TId(maybeIdent));
-			var maybes=["function","var","final"];
-			if(!maybe){
-				for(int in 0...maybes.length){
-					maybeIdent=maybes[int];
-					maybe=this.maybe(TId(maybeIdent));
-					if(maybe)break;
-				}
-				if(!maybe)unexpected(TId("private"));
-			}
-
-			switch(maybeIdent){
-				case "inline":
-					var tk = token();
-					var t=switch(tk){
-						case TId(s): s;
-						default: null;
-					};
-					var trk = {f:"inlineFunc",v:true,n:id};
-					switch(t){
-						case "function":
-							parseStructure("function",trk);
-						case "var" | "final":
-							trk.f=t=="final"?"inlineFinal":"inlineVar";
-							parseStructure(t,trk);
-						default:
-							unexpected(TId("public"));
-					}
-				default:
-					if(!maybes.contains(maybeIdent))
-						unexpected(TId(maybeIdent));
-					else {
-						parseStructure(maybeIdent,{f:"privateField",v:true,n:id});
-					}
-			}
-		case "public":
-			var maybeID="inline";
-			var maybe=maybe(TId(maybeID));
-			
-			var maybes=["var","final","function"];
-			if(!maybe)
-			{
-				for(int in 0...maybes.length){
-					maybeID=maybes[int];
-					maybe=this.maybe(TId(maybeID));
-					if(maybe)
-						break;
-				}
-				if(!maybe)
-					unexpected(TId("public"));
-			}
-			switch(maybeID){
-				case "inline":
-					var tk = token();
-					var t = null;
-					switch(tk){
-						case TId(s): t = s;
-						default: t = null;
-					};
-					switch(t){
-						case "function":
-							parseStructure(t,{f:"inlineFunc",v:true,n:id});
-						case "var" | "final":
-							parseStructure(t,{f:t=="final"?"inlineFinal":"inlineVar",v:true,n:id});
-						default:
-							unexpected(TId("public"));
-					}
-				default: 
-					if(!maybes.contains(maybeID))
-						unexpected(TId(maybeID));
-					else{
-						var e=parseStructure(maybeID,{f:"publicField",v:true,n:id});
-						e;
-					}
-			}
-		case "inline":
-			if (maybe(TId("public")))
-				parseStructure("public");
-			else{ 
-			if( !maybe(TId("function")) ) unexpected(TId("inline"));
-			return parseStructure("function");}
 		case "function":
 			var tk = token();
 			var name = null;
@@ -912,14 +960,19 @@ class Parser {
 			default: push(tk);
 			}
 			var inf = parseFunctionDecl();
-			mk(EFunction(inf.args, inf.body, name, inf.ret, t, d),p1,pmax(inf.body));
+			mk(EFunction(inf.args,inf.body,name,inf.ret,inf.line),p1,pmax(inf.body));
 		case "return":
 			var tk = token();
 			push(tk);
 			var e = if( tk == TStatement ) null else parseExpr();
-			mk(EReturn(e),p1,if( e == null ) tokenMax else pmax(e));
+			if( tk == TStatement )
+				mk(EReturnEmpty,p1,tokenMax );
+			else 
+				mk(EReturn(e),p1,if( e == null ) tokenMax else pmax(e));
 		case "new":
 			var a = new Array();
+			var subIds = new Array();
+
 			a.push(getIdent());
 			while( true ) {
 				var tk = token();
@@ -928,13 +981,28 @@ class Parser {
 					a.push(getIdent());
 				case TPOpen:
 					break;
+				case TOp("<"):
+					while( true ) {
+						var t = token();
+						switch t {
+							case TId(s): subIds.push(s);
+							case TComma: t = token();
+								switch t {
+									case TId(s): subIds.push(s);
+									case TOp(">"): break;
+									case _: unexpected(t);
+								}
+							case TOp(">"): break;
+							case _: unexpected(t);
+						}
+					}
 				default:
 					unexpected(tk);
 					break;
 				}
 			}
 			var args = parseExprList(TPClose);
-			mk(ENew(a.join("."),args),p1);
+			mk(ENew(a.join("."),args,subIds),p1);
 		case "throw":
 			var e = parseExpr();
 			mk(EThrow(e),p1,pmax(e));
@@ -957,17 +1025,22 @@ class Parser {
 			var ce = parseExpr();
 			mk(ETry(e, cname, t, ce), p1, pmax(ce));
 		case "switch":
-			var e = parseExpr();
+			var parentExpr = parseExpr();
 			var def = null, cases = [];
 			ensure(TBrOpen);
 			while( true ) {
 				var tk = token();
 				switch( tk ) {
 				case TId("case"):
-					var c = { values : [], expr : null };
+					var c = { values : [], expr : null , ifExpr : null };
 					cases.push(c);
 					while( true ) {
 						var e = parseExpr();
+						switch Tools.expr(e) {
+							case EBinop("|", e1, e2):
+								e = mk(ESwitchBinop(parentExpr, e1, e2));
+							case _:
+						}
 						c.values.push(e);
 						tk = token();
 						switch( tk ) {
@@ -975,6 +1048,16 @@ class Parser {
 							// next expr
 						case TDoubleDot:
 							break;
+						case TId("if"):
+							var e = parseExpr();
+							c.ifExpr = e;
+							switch tk = token() {
+								case TComma:
+								case TDoubleDot: break;
+								case _: 
+									unexpected(tk);
+									break;
+							}
 						default:
 							unexpected(tk);
 							break;
@@ -999,6 +1082,15 @@ class Parser {
 						mk(EBlock([]), tokenMin, tokenMin);
 					else
 						mk(EBlock(exprs), pmin(exprs[0]), pmax(exprs[exprs.length - 1]));
+
+					for( i in c.values )
+					{
+						switch Tools.expr(i) {
+							case EIdent("_"):
+								def = c.expr;
+							case _:
+						}
+					}
 				case TId("default"):
 					if( def != null ) unexpected(tk);
 					ensure(TDoubleDot);
@@ -1028,14 +1120,22 @@ class Parser {
 					break;
 				}
 			}
-			mk(ESwitch(e, cases, def), p1, tokenMax);
+			mk(ESwitch(parentExpr, cases, def), p1, tokenMax);
 		
-		case 'using':
-			parseStructure('import');
-		case 'import':
+		case "using":
+			var path = getIdent();
+			if( path == null || path.length < 1 )
+				error(EInvalidAccess(path));
+
+			var c = Type.resolveClass(path);
+			if( c == null )
+				error(ECustom('Invalid class $path'));
+
+			return mk(EUsing(c,path));
+		case "import":
 			var path = [getIdent()];
-			var isStar;
-			isStar = false;
+			var isStar = false;
+			var asIdent = null;
 			while( true ) {
 				var t = token();
 				if( t != TDot ) {
@@ -1048,130 +1148,52 @@ class Parser {
 					path.push(id);
 				case TOp('*'):
 					isStar = true;
+					var tk = token();
+					if( tk == TStatement ) push(tk);
+					else if( tk != TEof ) unexpected(tk);
 					break;
 				default:
 					unexpected(t);
 				}
 			}
-
-			/*if(path.contains('*'))throw new Exception('"*" is not supported!');*/
-
-			var anPath:Array < String > = [];
-			var int : Int = 0;
-			for (i in path)
+			
+			if( isStar )
 			{
-				if (i == i.toLowerCase() && path.indexOf(i) == 0)
-				{
-					anPath.insert(0, '$i.');
-					//path.remove(i);
-					int++;
-				}
-				else if (i == i.toLowerCase() && path.indexOf(i) == int)
-				{
-					anPath[0] += '$i.';
-					//path.remove(i);
-					int++;
-				}
-				else if (path.indexOf(i) == int && path.indexOf(i) != 0)
-				{
-					anPath[0] += i;
-					//path.remove(i);
-				}
-				else if (path.indexOf(i) == int && int == 0)
-				{
-					anPath[0] = "";
-					anPath[0]+=i;
+				return mk(EImportStar(path.join('.')));
+			}
+
+			var tk = token();
+			if( tk == TStatement ) push(tk);
+			else if( Type.enumEq(tk,TId('as')) ) {
+				var tk = token();
+				switch tk {
+					case TId(s): asIdent = s;
+					case _: unexpected(tk);
 				}
 			}
 
-			var nulls = anPath[0].split('.');
-
-			for (i in nulls)
-				if (path.contains(i))
-					path.remove(i);
-
-			var maybe=maybe(TId("as"));
-			var asIdent:String=null;
-
-			if(maybe)asIdent=getIdent();
-
-			if(maybe&&""+asIdent=="null"&&isStar)
-				unexpected(TId("as"));
-
-			var cl:String = null;
-			var eclass:Dynamic = null;
-			if (path.length > 1)
-			{
-				var c:Class<Dynamic> = Type.resolveClass(anPath[0]);
-				var property:Dynamic = Reflect.getProperty(c, path[0]);
-				
-				for(i in 1...path.length - 1)
-				{
-					property = Reflect.getProperty(property, path[i]);
-				}
-
-				cl = path[path.length - 1];
-				property = Reflect.getProperty(property, cl);
-				if(maybe&&''+asIdent!="null")
-					cl=asIdent;
-				var ps = new Array();
-				if(isStar){
-					var prop=Reflect.fields(property);
-					for(eprop in prop)
-						ps.push(Reflect.field(property, eprop));
-				}
-				
-				EImport( property, cl );
-			}
-			else 
-			{
-				if(path.length == 0)
-				{
-					eclass = Type.resolveClass(anPath[0]);
-					if(eclass==null)eclass=Type.resolveEnum(anPath[0]);
-					cl = nulls[nulls.length - 1];
-					if(maybe&&''+asIdent!="null")
-						cl=asIdent;
-				}
-				else 
-				{
-					if(path[0].startsWith(path[0].substring(0, 1).toLowerCase()))
-					{
-						eclass = Type.resolveClass(anPath[0]);
-						if(eclass==null)eclass=Type.resolveEnum(anPath[0]);
-						var prop = Reflect.getProperty(eclass, path[0]);
-						eclass = prop;
-						cl = path[0];
-						if(maybe&&''+asIdent!="null")
-							cl=asIdent;
-					}
-					if (path[0].startsWith(path[0].substring(0, 1).toUpperCase()))
-					{
-						try{
-						eclass = Type.resolveClass(anPath[0]);
-						if(eclass==null)eclass=Type.resolveEnum(anPath[0]);
-						var prop = Reflect.getProperty(eclass, path[0]);
-						eclass = prop;
-						cl = path[0];
-						if(maybe&&''+asIdent!="null")
-						cl=asIdent;}
-						catch(e){
-							try{
-								cl = path[0];
-								eclass = Type.resolveClass(cl);
-								if(eclass==null)eclass=Type.resolveEnum(anPath[0]);
-								if(maybe&&''+asIdent!="null")
-									cl=asIdent;
-							}
-							catch(ec){
-								throw ec;
-							}
-						}
+			var fullName = path.join('.');
+			var cl = Tools.resolve(fullName);
+			if( cl == null ) {
+				var fields = [];
+				var fieldCl = null;
+				for( i in path ) {
+					fields.push(i);
+					var cl = Tools.resolve(fields.join('.'));
+					if( cl != null ) {
+						fieldCl = cl;
+						break;
 					}
 				}
+				for( i in fields.length...path.length ) {
+					var field = path[i];
+					fieldCl = Reflect.getProperty(fieldCl,field);
+				}
+
+				cl = fieldCl;
 			}
-			mk(EImport( eclass , cl));
-		case 'package':
+			return mk(EImport(cl,path[path.length-1],asIdent,fullName)); 
+		case "package":
 			var path = [getIdent(false)];
 			if (!path.contains(null))
 				while( true ) {
@@ -1231,7 +1253,23 @@ class Parser {
 			return makeBinop(op,e1,parseExpr());
 		case TDot:
 			var field = getIdent();
-			return parseExprNext(mk(EField(e1,field),pmin(e1)));
+			var pushed = false;
+			var fields = switch Tools.expr(e1) {
+				case EField(_,_,fAll):
+					var f = fAll.copy();
+					f.push(field);
+					pushed = true;
+					f;
+				case _: [];
+			}
+
+			switch Tools.expr(e1) {
+				case EIdent(v): fields.push(v);
+				case _:
+			}
+			if (!pushed)
+				fields.push(field);
+			return parseExprNext(mk(EField(e1,field,fields),pmin(e1)));
 		case TPOpen:
 			return parseExprNext(mk(ECall(e1,parseExprList(TPClose)),pmin(e1)));
 		case TBkOpen:
@@ -1239,32 +1277,28 @@ class Parser {
 			ensure(TBkClose);
 			return parseExprNext(mk(EArray(e1,e2),pmin(e1)));
 		case TQuestion:
+			var e2 = parseExpr();
+			ensure(TDoubleDot);
+			var e3 = parseExpr();
+			return mk(ETernary(e1,e2,e3),pmin(e1),pmax(e3));
+		case TQDouble:
+			var e2 = parseExpr();
+			return mk(ECoalesce(e1,e2,false), pmin(e1));
+		case TQDoubleAssign:
+			var e2 = parseExpr();
+			return mk(ECoalesce(e1,e2,true), pmin(e1));
+		case TQDot:
 			var oldPos_ = readPos;
-			var tk2 = token();
-			return switch (tk2)
-			{
-				case TQuestion:
-					var oldPos = readPos;
-					var tk1 = token();
-					var assign = false;
-					var e2;
-					if (Type.enumEq(tk1, TOp('=')))
-						assign = true;
-					if(!assign){readPos=oldPos - 1; while(true){tk1 = token(); if(tk1 == TQuestion)break;}} //cheap way to revert tokens
-					e2 = parseExpr();
-					mk(ECoalesce(e1,e2,assign));
-				default:
-					readPos=oldPos_ - 1;
-					while(true)
-					{
-						tk2=token();
-						if(tk2==TQuestion)break;
-					}
-					var e2 = parseExpr();
-					ensure(TDoubleDot);
-					var e3 = parseExpr();
-					return mk(ETernary(e1,e2,e3),pmin(e1),pmax(e3));
+			var tk = token();
+			switch tk {
+				case TId(s):
+					//push(tk);
+					return mk(ESafeNavigator(e1, s), pmin(e1));
+				case _:
 			}
+
+			unexpected(tk);
+			return null; 
 		default:
 			push(tk);
 			return e1;
@@ -1297,7 +1331,15 @@ class Parser {
 					if( maybe(TDoubleDot) )
 						arg.t = parseType();
 					if( maybe(TOp("=")) )
+					{
 						arg.value = parseExpr();
+						switch arg.value.e {
+							case EConst(_):
+							case EIdent("null"):
+							case _: error(ECustom('Default argument value should be constant'));
+						}
+						//arg.opt = true;
+					}
 				}
 				tk = token();
 				switch( tk ) {
@@ -1317,6 +1359,7 @@ class Parser {
 		ensure(TPOpen);
 		var args = parseFunctionArgs();
 		var ret = null;
+		var line:Null<Int> = this.line;
 		if( allowTypes ) {
 			var tk = token();
 			if( tk != TDoubleDot )
@@ -1324,7 +1367,7 @@ class Parser {
 			else
 				ret = parseType();
 		}
-		return { args : args, ret : ret, body : parseExpr() };
+		return { args : args, ret : ret, body : parseExpr() , line : line };
 	}
 
 	function parsePath() {
@@ -1360,11 +1403,7 @@ class Parser {
 						case TOp(op):
 							if( op == ">" ) break;
 							if( op.charCodeAt(0) == ">".code ) {
-								#if hscriptPos
 								tokens.add({ t : TOp(op.substr(1)), min : tokenMax - op.length - 1, max : tokenMax });
-								#else
-								tokens.add(TOp(op.substr(1)));
-								#end
 								break;
 							}
 						default:
@@ -1403,7 +1442,7 @@ class Parser {
 						switch arg.value {
 							case null:
 							case v:
-								error(ECustom('Default values not allowed in function types'), #if hscriptPos v.pmin, v.pmax #else 0, 0 #end);
+								error(ECustom('Default values not allowed in function types'), v.pmin, v.pmax);
 						}
 
 						CTNamed(arg.name, if (arg.opt) CTOpt(arg.t) else arg.t);
@@ -1450,7 +1489,7 @@ class Parser {
 					case TBrClose: break;
 					default: unexpected(t);
 					}
-				case TMeta(name):
+				case TMeta(_,name):
 					if( meta == null ) meta = [];
 					meta.push({ name : name, params : parseMetaArgs() });
 				default:
@@ -1506,221 +1545,6 @@ class Parser {
 		return args;
 	}
 
-	// ------------------------ module -------------------------------
-
-	public function parseModule( content : String, ?origin : String ) {
-		initParser(origin);
-		input = content;
-		readPos = 0;
-		allowTypes = true;
-		allowMetadata = true;
-		var decls = [];
-		while( true ) {
-			var tk = token();
-			if( tk == TEof ) break;
-			push(tk);
-			decls.push(parseModuleDecl());
-		}
-		return decls;
-	}
-
-	function parseMetadata() : Metadata {
-		var meta = [];
-		while( true ) {
-			var tk = token();
-			switch( tk ) {
-			case TMeta(name):
-				meta.push({ name : name, params : parseMetaArgs() });
-			default:
-				push(tk);
-				break;
-			}
-		}
-		return meta;
-	}
-
-	function parseParams() {
-		if( maybe(TOp("<")) )
-			error(EInvalidOp("Unsupported class type parameters"), readPos, readPos);
-		return {};
-	}
-
-	function parseModuleDecl() : ModuleDecl {
-		var meta = parseMetadata();
-		var ident = getIdent();
-		var isPrivate = false, isExtern = false;
-		while( true ) {
-			switch( ident ) {
-			case "private":
-				isPrivate = true;
-			case "extern":
-				isExtern = true;
-			default:
-				break;
-			}
-			ident = getIdent();
-		}
-		switch( ident ) {
-		case "package":
-			var path = parsePath();
-			ensure(TStatement);
-			return DPackage(path);
-		case "import":
-			var path = [getIdent()];
-			var star = false;
-			while( true ) {
-				var t = token();
-				if( t != TDot ) {
-					push(t);
-					break;
-				}
-				t = token();
-				switch( t ) {
-				case TId(id):
-					path.push(id);
-				case TOp("*"):
-					star = true;
-				default:
-					unexpected(t);
-				}
-			}
-			var id=null;
-			/*var t = token();
-			switch t{
-				case TStatement:
-				case TId(s): 
-					if(s!='as')
-						error(ECustom('Unexpected $s'));
-					id = getIdent();
-				case _: error(EUnexpected(tokenString(t)));
-			}*/
-			ensureToken(TStatement);
-			return DImport(path, star, id);
-		case "class":
-			var name = getIdent();
-			var params = parseParams();
-			var extend = null;
-			var implement = [];
-
-			while( true ) {
-				var t = token();
-				switch( t ) {
-				case TId("extends"):
-					extend = parseType();
-				case TId("implements"):
-					implement.push(parseType());
-				default:
-					push(t);
-					break;
-				}
-			}
-
-			var fields = [];
-			ensure(TBrOpen);
-			while( !maybe(TBrClose) )
-				fields.push(parseField());
-
-			return DClass({
-				name : name,
-				meta : meta,
-				params : params,
-				extend : extend,
-				implement : implement,
-				fields : fields,
-				isPrivate : isPrivate,
-				isExtern : isExtern,
-			});
-		case "typedef":
-			var name = getIdent();
-			var params = parseParams();
-			ensureToken(TOp("="));
-			var t = parseType();
-			return DTypedef({
-				name : name,
-				meta : meta,
-				params : params,
-				isPrivate : isPrivate,
-				t : t,
-			});
-
-		default:
-			unexpected(TId(ident));
-		}
-		return null;
-	}
-	
-	function parseField() : FieldDecl {
-		var meta = parseMetadata();
-		var access = [];
-		while( true ) {
-			var id = getIdent();
-			switch( id ) {
-			case "override":
-				access.push(AOverride);
-			case "public":
-				access.push(APublic);
-			case "private":
-				access.push(APrivate);
-			case "inline":
-				access.push(AInline);
-			case "static":
-				access.push(AStatic);
-			case "macro":
-				access.push(AMacro);
-			case "function":
-				var name = getIdent();
-				var inf = parseFunctionDecl();
-				return {
-					name : name,
-					meta : meta,
-					access : access,
-					kind : KFunction({
-						args : inf.args,
-						expr : inf.body,
-						ret : inf.ret,
-					}),
-				};
-			case "var":
-				var name = getIdent();
-				var get = null, set = null;
-				if( maybe(TPOpen) ) {
-					get = getIdent();
-					ensure(TComma);
-					set = getIdent();
-					ensure(TPClose);
-				}
-				var type = maybe(TDoubleDot) ? parseType() : null;
-				var expr = maybe(TOp("=")) ? parseExpr() : null;
-
-				if( expr != null ) {
-					if( isBlock(expr) )
-						maybe(TStatement);
-					else
-						ensure(TStatement);
-				} else if( type != null && type.match(CTAnon(_)) ) {
-					maybe(TStatement);
-				} else
-					ensure(TStatement);
-
-				return {
-					name : name,
-					meta : meta,
-					access : access,
-					kind : KVar({
-						get : get,
-						set : set,
-						type : type,
-						expr : expr,
-					}),
-				};
-			default:
-				unexpected(TId(id));
-				break;
-			}
-		}
-		return null;
-	}
-
 	// ------------------------ lexing -------------------------------
 
 	inline function readChar() {
@@ -1733,9 +1557,7 @@ class Parser {
 		var esc = false;
 		var old = line;
 		var s = input;
-		#if hscriptPos
 		var p1 = readPos - 1;
-		#end
 		while( true ) {
 			var c = readChar();
 			if( StringTools.isEof(c) ) {
@@ -1746,49 +1568,27 @@ class Parser {
 			if( esc ) {
 				esc = false;
 				switch( c ) {
-				case 'n'.code: b.addChar('\n'.code);
-				case 'r'.code: b.addChar('\r'.code);
-				case 't'.code: b.addChar('\t'.code);
-				case "'".code, '"'.code, '\\'.code: b.addChar(c);
-				case '/'.code: if( allowJSON ) b.addChar(c) else invalidChar(c);
-				case "u".code:
-					if( !allowJSON ) invalidChar(c);
-					var k = 0;
-					for( i in 0...4 ) {
-						k <<= 4;
-						var char = readChar();
-						switch( char ) {
-						case 48,49,50,51,52,53,54,55,56,57: // 0-9
-							k += char - 48;
-						case 65,66,67,68,69,70: // A-F
-							k += char - 55;
-						case 97,98,99,100,101,102: // a-f
-							k += char - 87;
-						default:
-							if( StringTools.isEof(char) ) {
-								line = old;
-								error(EUnterminatedString, p1, p1);
-							}
-							invalidChar(char);
-						}
-					}
-					b.addChar(k);
-				default: invalidChar(c);
+					case 'n'.code: b.addChar('\n'.code);
+					case 'r'.code: b.addChar('\r'.code);
+					case 't'.code: b.addChar('\t'.code);
+					case "'".code, '"'.code, '\\'.code: b.addChar(c);
+					default: invalidChar(c);
 				}
 			} else if( c == 92 )
 				esc = true;
 			else if( c == until )
 				break;
 			else {
-				if( c == 10 ) line++;
+				if( c == 10 )
+					line++;
+
 				b.addChar(c);
 			}
 		}
-		return b.toString();
+		return new String(b.toString());
 	}
 
 	function token() {
-		#if hscriptPos
 		var t = tokens.pop();
 		if( t != null ) {
 			tokenMin = t.min;
@@ -1799,20 +1599,16 @@ class Parser {
 		oldTokenMax = tokenMax;
 		tokenMin = (this.char < 0) ? readPos : readPos - 1;
 		var t = _token();
-		switch (t)
-		{
-			case TId(s): if(s=="cast"||s=="untyped") t=TOp(s);
-			default:
+		switch t {
+			case TId("is"):
+				t = TOp("is");
+			case _:
 		}
 		tokenMax = (this.char < 0) ? readPos - 1 : readPos - 2;
 		return t;
 	}
 
 	function _token() {
-		#else
-		if( !tokens.isEmpty() )
-			return tokens.pop();
-		#end
 		var char;
 		if( this.char < 0 )
 			char = readChar();
@@ -1829,13 +1625,9 @@ class Parser {
 			case 0:
 				return TEof;
 			case 32,9,13: // space, tab, CR
-				#if hscriptPos
 				tokenMin++;
-				#end
 			case 10: line++; // LF
-				#if hscriptPos
 				tokenMin++;
-				#end
 			case 48,49,50,51,52,53,54,55,56,57: // 0...9
 				var n = (char - 48) * 1.0;
 				var exp = 0.;
@@ -1951,12 +1743,120 @@ class Parser {
 					this.char = char;
 					return TDot;
 				}
+			case "~".code: 
+				char = readChar();
+				if( char == '/'.code ) {
+					var chars = [];
+					var optChars = [""];
+					while( true ) {
+						var char = readChar();
+						var buf = new StringBuf();
+
+						function escapeSequences(c,?buf)
+						{
+							if( c == ".".code )
+							{
+								chars.push(".");
+							}
+							else if( c == "n".code )
+							{
+								chars.push("\n");
+							}
+							else if( c == "t".code )
+							{
+								chars.push("\t");
+							}
+							else if( c == "r".code )
+							{
+								chars.push("\r");
+							}
+							else 
+							{
+								chars.push("\\" + String.fromCharCode(c));
+							}
+							if( buf != null )
+								buf.add(chars.pop());
+						}
+
+						if( char == "[".code || char == "(".code || char == "{".code )
+						{
+							buf.add(String.fromCharCode(char));
+							var oldChar = String.fromCharCode(char);
+							while( true )
+							{
+								var char = readChar();
+								if( char == "\\".code )
+								{
+									var c = readChar();
+									escapeSequences(c,buf);
+								}
+								else
+									buf.add(String.fromCharCode(char));
+
+								if( (oldChar == "[" && char == "]".code)
+									|| (oldChar == "(" && char == ")".code)
+									|| (oldChar == "{" && char == "}".code) )
+								{
+									chars.push(buf.toString());
+									buf = null;
+									break;
+								}
+							}
+						}
+						else if( char == "\\".code )
+						{
+							var c = readChar();
+							escapeSequences(c);
+						}
+						else if( char == "/".code )
+						{
+							while( true ) {
+								var flags = ["g".code, "i".code, "s".code, "u".code, "m".code];
+								var c = readChar();
+
+								if( !flags.contains(c) )
+								{
+									readPos--;
+									break;
+								}
+								else 
+									optChars.push(String.fromCharCode(c));
+							}
+							break;
+						}	
+						else 
+							chars.push(String.fromCharCode(char));
+					}
+					return TEReg(chars.join(""), optChars.join(""));
+				}
+				else 
+				{
+					readPos--;
+					return TOp("~");
+				}
 			case "{".code: return TBrOpen;
 			case "}".code: return TBrClose;
 			case "[".code: return TBkOpen;
 			case "]".code: return TBkClose;
-			case "'".code, '"'.code: return TConst( CString(readString(char), true) );
-			case "?".code: return TQuestion;
+			case "'".code, '"'.code: return TConst( CString(readString(char), char==39) );
+			case "?".code: 
+				char = readChar();
+				if( char == '.'.code )
+					return TQDot;
+				else if ( char == '?'.code )
+				{
+					char = readChar();
+
+					if( char == '='.code )
+						return TQDoubleAssign;
+					else
+						readPos--;
+
+					return TQDouble;
+				}
+
+				this.char = char;
+				return TQuestion;
 			case ":".code: return TDoubleDot;
 			case '='.code:
 				char = readChar();
@@ -1964,35 +1864,19 @@ class Parser {
 					return TOp("==");
 				else if ( char == '>'.code )
 					return TOp("=>");
-				char=readChar();
-				if ( char == '='.code )
-						return TOp("===");
 				
 				this.char = char;
 				return TOp("=");
 			case '@'.code:
 				char = readChar();
+				var dot = char == ':'.code;
 				if( idents[char] || char == ':'.code ) {
-					var id = String.fromCharCode(char);
+					var id = char == ':'.code ? "" : String.fromCharCode(char);
 					while( true ) {
 						char = readChar();
 						if( !idents[char] ) {
 							this.char = char;
-							return TMeta(id);
-						}
-						id += String.fromCharCode(char);
-					}
-				}
-				invalidChar(char);
-			case '#'.code:
-				char = readChar();
-				if( idents[char] ) {
-					var id = String.fromCharCode(char);
-					while( true ) {
-						char = readChar();
-						if( !idents[char] ) {
-							this.char = char;
-							return preprocess(id);
+							return TMeta(dot,id);
 						}
 						id += String.fromCharCode(char);
 					}
@@ -2037,231 +1921,6 @@ class Parser {
 		return null;
 	}
 
-	var preprocStack : Array<{ r : Bool }>;
-
-	function parsePreproCond() {
-		var tk = token();
-		return switch( tk ) {
-		case TPOpen:
-			push(tk);
-			parseExpr();
-		case TId(id):
-			mk(EIdent(id), tokenMin, tokenMax);
-		case TOp("!"):
-			mk(EUnop("!", true, parsePreproCond()), tokenMin, tokenMax);
-		default:
-			unexpected(tk);
-		}
-	}
-
-	function evalPreproCond( e : Expr ) : Bool {
-		function evalBinop(eexpr:ExprDef):Bool
-		{
-			switch eexpr{
-				case EBinop(v,e1,e2):
-					var id1:String=null,id2:String=null;
-					switch Tools.expr(e1){
-						case EIdent(e,_):
-							id1=e;
-						case EConst(c):
-							switch c {
-								case CString(s,_):
-									id1=s;
-								case CInt(v):
-									id1=Std.string(v);
-								case CFloat(f):
-									id1=Std.string(f);
-								case _:
-							}
-						case _:
-					}
-					switch Tools.expr(e2){
-						case EIdent(e,_):
-							id2=e;
-						case EConst(c):
-							switch c {
-								case CString(s,_):
-									id2=s;
-								case CInt(v):
-									id2=Std.string(v);
-								case CFloat(f):
-									id2=Std.string(f);
-								case _:
-							}
-						case _:
-					}
-					if( id1!=null )
-					{
-						var definedValue:String = SScript.defines[id1];
-						if(definedValue==null)
-							definedValue=id1;
-						if (definedValue!=null
-							&&id2!=null
-							&&(definedValue.contains('.') || definedValue.contains('-'))
-							&&(id2.contains('.') || id2.contains('-')))
-						{
-							definedValue = definedValue.split('.').join('');
-							definedValue = definedValue.split('-').join('');
-							id2 = id2.split('.').join('');
-							id2 = id2.split('-').join('');
-
-							if(definedValue.length!=id2.length)
-							{
-								if(id2.length<definedValue.length)
-									while(id2.length<definedValue.length)
-										id2+='0';
-								else 
-									while(definedValue.length<id2.length)
-										id2+='0';
-							}
-						}
-						if(definedValue!=null)
-						{
-							var float2:Null<Float>=Std.parseFloat(definedValue),float3:Null<Float>=Std.parseFloat(id2);
-							var int2:Null<Int>=Std.parseInt(definedValue),int3:Null<Int>=Std.parseInt(id2);
-							switch v{
-								case '==':
-									if ( id2==definedValue )
-										return true;
-									else if ( float2!=null&&float3!=null&&float2==float3 )
-										return true;
-									else if ( int2!=null&&int3!=null&&int2==int3 )
-										return true;
-								case '!=':
-									if ( id2!=definedValue )
-										return true;
-									else if ( float2!=null&&float3!=null&&float2!=float3 )
-										return true;
-									else if ( int2!=null&&int3!=null&&int2!=int3 )
-										return true;
-								case '>=':
-									if ( float2!=null&&float3!=null&&float2>=float3 )
-										return true;
-									else if ( int2!=null&&int3!=null&&int2>=int3 )
-										return true;
-								case '<=':
-									if ( float2!=null&&float3!=null&&float2<=float3 )
-										return true;
-									else if ( int2!=null&&int3!=null&&int2<=int3 )
-										return true;
-								case '<':
-									if ( float2!=null&&float3!=null&&float2<float3 )
-										return true;
-									else if ( int2!=null&&int3!=null&&int2<int3 )
-										return true;
-								case '>':
-									if ( float2!=null&&float3!=null&&float2>float3 )
-										return true;
-									else if ( int2!=null&&int3!=null&&int2>int3 )
-										return true;
-									
-							}
-						}
-					}
-				case _:
-			}
-
-			return false;
-		}
-
-		var expr1 = expr(e);
-		switch( expr1 ) {
-		case EIdent(id,_):
-			return SScript.defines.exists(id);
-		case EUnop("!", _, e):
-			return !!!evalPreproCond(e);
-		case EParent(e):
-			return evalPreproCond(e);
-		case EBinop("==", e1, e2):
-			return evalBinop(expr1);
-		case EBinop(">=", e1, e2):
-			return evalBinop(expr1);
-		case EBinop("<=", e1, e2):
-			return evalBinop(expr1);
-		case EBinop("<", e1, e2):
-			return evalBinop(expr1);
-		case EBinop(">", e1, e2):
-			return evalBinop(expr1);
-		case EBinop("!=", e1, e2):
-			return evalBinop(expr1);
-		case EBinop("&&", e1, e2):
-			return evalPreproCond(e1) && evalPreproCond(e2);
-		case EBinop("||", e1, e2):
-			return evalPreproCond(e1) || evalPreproCond(e2);
-		default:
-			error(EInvalidPreprocessor("Can't eval " + expr(e).getName()), readPos, readPos);
-			return false;
-		}
-	}
-
-	var poppedStack:Array<{r:Bool}> = [];
-	function preprocess( id : String ) : Token {
-		function containsTrue():Bool
-		{
-			for( i in poppedStack )
-				if( i.r ) return true;
-
-			return false;
-		}
-		switch( id ) {
-		case "if":
-			var e = parsePreproCond();
-			if( evalPreproCond(e) ) {
-				preprocStack.push({ r : true });
-				poppedStack.push({ r : true });
-				var t = token();
-				return t;
-			}
-			preprocStack.push({ r : false });
-			poppedStack.push({ r : false });
-			skipTokens();
-			return token();
-		case "else", "elseif" if( preprocStack.length > 0 ):
-			if( preprocStack[preprocStack.length - 1].r ) {
-				preprocStack[preprocStack.length - 1].r = false;
-				skipTokens();
-				return token();
-			} else if( id == "else") {
-				if(!containsTrue())
-				{
-					poppedStack.push(preprocStack.pop());
-					preprocStack.push({ r : true });
-				}
-				return token();
-			} else {
-				// elseif
-				preprocStack.pop();
-				var t = preprocess("if");
-				return t;
-			}
-		case "end" if( preprocStack.length > 0 ):
-			while(poppedStack.length>0)
-				poppedStack.pop();
-
-			preprocStack.pop();
-			var t = token();
-			return t;
-		default:
-			error(ECustom('Unexpected $id'));
-			return null;
-		}
-	}
-
-	function skipTokens() {
-		var spos = preprocStack.length - 1;
-		var obj = preprocStack[spos];
-		var pos = readPos;
-		while( true ) {
-			var tk = token();
-			if( tk == TEof && preprocStack.length >= 1 )
-				error(EInvalidPreprocessor("Unclosed"), pos, pos);
-			if( preprocStack[spos] != obj ) {
-				push(tk);
-				break;
-			}
-		}
-	}
-
 	function tokenComment( op : String, char : Int ) {
 		var c = op.charCodeAt(1);
 		var s = input;
@@ -2304,7 +1963,7 @@ class Parser {
 		return TOp(op);
 	}
 
-	function constString( c ) {
+	static function constString( c ) {
 		return switch(c) {
 		case CInt(v): Std.string(v);
 		case CFloat(f): Std.string(f);
@@ -2315,8 +1974,9 @@ class Parser {
 		}
 	}
 
-	function tokenString( t ) {
+	public static function tokenString( t ) {
 		return switch( t ) {
+		case TEReg(r,op): return "~/" + r + "/" + op;
 		case TEof: "<eof>";
 		case TConst(c): constString(c);
 		case TId(s): s;
@@ -2330,10 +1990,12 @@ class Parser {
 		case TStatement: ";";
 		case TBkOpen: "[";
 		case TBkClose: "]";
+		case TQDot: "?.";
+		case TQDouble: "??";
+		case TQDoubleAssign: "??=";
 		case TQuestion: "?";
 		case TDoubleDot: ":";
-		case TMeta(id): "@" + id;
-		case TPrepro(id): "#" + id;
+		case TMeta(dot,id): "@" + (if( dot ) ":" else "") + id;
 		case TEol: null;
 		}
 	}
