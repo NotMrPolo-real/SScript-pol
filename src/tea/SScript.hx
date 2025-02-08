@@ -20,7 +20,7 @@ import tea.backend.SScriptX;
 
 using StringTools;
 
-typedef SCall =
+typedef Tea =
 {
 	public var ?fileName(default, null):String;
 	public var ?className(default, null):String;
@@ -499,10 +499,10 @@ class SScript
 		@param className If provided, searches the specific class. If the function is not found, other classes will be searched.
 		@return Returns an unique structure that contains called function, returned value etc. Returned value is at `returnValue`.
 	**/
-	public function call(func:String, ?args:Array<Dynamic>, ?className:String):SCall
+	public function call(func:String, ?args:Array<Dynamic>, ?className:String):Tea
 	{
 		var scriptFile:String = if (scriptFile != null && scriptFile.length > 0) scriptFile else "";
-		var caller:SCall = {
+		var caller:Tea = {
 			exceptions: [],
 			calledFunction: func,
 			succeeded: false,
@@ -535,7 +535,7 @@ class SScript
 			pushException('Function name cannot be null for $scriptFile!');
 			return caller;
 		}
-		var callX:SCall = null;
+		var callX:Tea = null;
 		if (scriptX != null)
 		{
 			callX = scriptX.callFunction(func);

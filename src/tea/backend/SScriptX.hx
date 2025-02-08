@@ -10,7 +10,7 @@ import sys.FileSystem;
 import sys.io.File;
 #end
 
-import tea.SScript.SCall;
+import tea.SScript.Tea;
 
 #if openflPos
 import openfl.Assets;
@@ -144,7 +144,7 @@ class SScriptX
 		@param className Optional class to check.
 		@return Returns the return value, the class name and exceptions (if there are any).
 	**/
-	function callFunction(func:String, ?args:Array<Dynamic>, ?className:String):SCall
+	function callFunction(func:String, ?args:Array<Dynamic>, ?className:String):Tea
 	{
 		var cl = className == null ? null : classes[className];
 		if (cl != null)
